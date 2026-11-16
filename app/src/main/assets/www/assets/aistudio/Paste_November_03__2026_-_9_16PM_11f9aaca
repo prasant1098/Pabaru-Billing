@@ -1,0 +1,579 @@
+Here is an exhaustive, numbered catalog of residual bugs, edge cases, statutory non-compliances, runtime exceptions, and security vulnerabilities spanning every layer of the codebase:
+
+---
+
+### Section 1: Android Kotlin Architecture, Room DB & Lifecycle (Bugs 1–45)
+
+1. **`PabaruViewModel.initDatabase()` DB Reference Race Condition**: `database` is assigned outside the synchronized block without `@Volatile` or an atomic reference, risking memory visibility issues across threads.
+2. **Missing `synchronized` Block Inside `PabaruViewModel.initDatabase**`: If two UI components call `initDatabase(context)` concurrently, two separate `viewModelScope.launch(Dispatchers.IO)` jobs can run simultaneously, racing to seed default records.
+3. **Primary Key Overwrite during DB Seeding**: Seeding uses `insertAll` without checking individual keys; if partial data exists, defaults overwrite modified tenant data.
+4. **Room Entity Nullability Mismatch for `PartyEntity.openingBalancePaise**`: In Room schema, `openingBalancePaise` is `NOT NULL`, but web engine seeds objects where `opening_balance` can be null, causing Room insertion exceptions on import.
+5. **Missing Indices on Room Foreign-Key Columns**: `TransactionEntity.partyId` and `branchId` have no SQLite `@Index`. Querying transactions by party or branch causes full table scans on devices with large datasets.
+6. **Missing Index on `audit_logs.timestamp` and `recordHash**`: Hash verification walks sequentially; verifying ledger states without indexed `recordHash` causes SQLite read bottlenecks.
+7. **`PabaruDatabase` Lacks Wal Mode / Journal Mode Configuration**: By default, Room may run in rollback journal mode instead of WAL (Write-Ahead Logging), blocking reads while inserting large transaction batches.
+8. **Missing Migration Path from DB Version 1/2/3 to 4**: `PabaruDatabase` defines `version = 4` without migration scripts or `.fallbackToDestructiveMigration()`. Upgrading from an older APK crashes with `IllegalStateException: A migration from X to 4 was required but not found`.
+9. **`TransactionEntity.toDomain` Unhandled `TransactionType` Parsing**: When string representation has leading/trailing whitespaces or lower-case ("paymentin"), `when` matching falls through to `try-catch`, which falls back to `TransactionType.Sale`, converting receipts into sales.
+10. **`ExpenseCategory.valueOf` Crash on Case Mismatch**: In `TransactionEntity.toDomain()`, `ExpenseCategory.valueOf(expenseCategory.trim())` will throw `IllegalArgumentException` if JSON stores `"direct"` (lowercase), defaulting to `Direct` regardless of user selection.
+11. **`PaymentMode.valueOf` Crash on Custom/New Modes**: Unrecognized or legacy modes (e.g. `"Card"` or `"POS"`) throw exceptions inside `toDomain()` and default silently to `PaymentMode.Cash`.
+12. **`BusinessProfileEntity.toDomain` Registration Type Parsing**: `RegistrationType.valueOf(registrationType)` expects lowercase enum names (`regular`, `composition`). If database stores `"REGULAR"` (uppercase), it throws and defaults to `regular`, discarding composition status.
+13. **`ManagedUserEntity` Sync Timestamps Stored as System Clock Instead of NTP / Monotonic Time**: If user changes Android device date to backdate invoices, `lastSyncTimestamp` becomes corrupted and prevents future cloud synchronizations.
+14. **Lack of Transactional Boundary in `recordItemizedInvoice**`: Transaction record insertion and product stock reduction run in separate non-atomic queries; if the app crashes halfway through, stock is reduced without a recorded transaction.
+15. **Lack of Transactional Boundary in `voidTransaction**`: Marking transaction `isVoided = 1` and restoring inventory stock in `ProductDao` are not wrapped in a `@androidx.room.Transaction`, allowing partial state corruption on failure.
+16. **Concurrent Stock Modification Race Condition**: When two invoices are generated in rapid succession, `updateStock` reads and writes `currentStock` asynchronously without atomic decrement (`currentStock = currentStock - :qty`), causing lost updates.
+17. **`PabaruTypeConverters.fromInvoiceLineItemList` Unhandled Special Characters in Item Names**: Uses manual `JSONObject.put()`. If an item name contains raw unicode control characters or unescaped quotes, `JSONArray` serialization can emit non-standard JSON.
+18. **`PabaruTypeConverters.toInvoiceLineItemList` Silent Failure on Truncated JSON**: Corrupted JSON strings return `emptyList()` silently without notifying the user, hiding invoice details permanently.
+19. **Unchecked `toIntOrNull()` in `normalizeDate` Leading to Year 2026 Fallback**: `normalizeDate("31/02/2026")` silently returns invalid calendar dates instead of failing validation.
+20. **`normalizeDate` Inversion for Ambiguous Numeric Formats**: Format `01/02/2026` is assumed to be `DD-MM-YYYY` (`p2.length == 4`), but if an input is in `MM-DD-YYYY`, month and date are permanently flipped.
+21. **`isDateInCurrentFinancialYear` Calendar Instance Re-Creation Overhead**: Every call instantiates a new `java.util.Calendar.getInstance()`, creating unnecessary object allocation during large list filtering.
+22. **`CryptoEngine.hashPin` Leaks Byte Array in Memory**: `PBEKeySpec` and derived byte arrays are never zeroized (`Arrays.fill(salt, 0.toByte())`), leaving decrypted hashes in Android heap memory accessible via memory dump.
+23. **`CryptoEngine.sha256` Allocates Repeated MessageDigest Instances**: Instantiating `MessageDigest.getInstance("SHA-256")` on every single line item and audit record degrades verification speed on budget Android hardware.
+24. **`CryptoEngine.safeBase64Encode` NO_WRAP vs DEFAULT Flag Inconsistency**: JVM fallback uses `java.util.Base64.getEncoder().encodeToString(bytes)` which does not emit line breaks, but Android API reflection might pass flag `2` (NO_WRAP); any divergence produces mismatched SHA-256 signatures.
+25. **`PabaruViewModel.setMasterPin` Overwrites Salt Without Re-Hashing Managed PINs**: Setting a new master PIN generates a new `managerPinSalt`, invalidating any existing manager PIN that relied on the shared salt.
+26. **`PabaruViewModel.verifyMasterPin` Fallback Bypass**: If `masterPinHash` is empty, PIN `"9999"` unlocks master mode even if the user previously erased credentials.
+27. **`PabaruViewModel.signIn` Case Sensitivity Inconsistencies**: Checking `trimmedInput.equals(p.storeCode)` is case-insensitive, but staff user ID checks use `trimmedInput.equals(s.id)` which is case-sensitive, blocking staff login if store code casing varies.
+28. **`PabaruViewModel.signIn` Weak Fallback Allows Arbitrary PIN Bypass**: In `signIn`, the final `else` branch signs the user in as `Owner` with full privileges for *any* unrecognized input:
+```kotlin
+} else {
+    // Default demo sign-in
+    _uiState.value = _uiState.value.copy(profile = p.copy(isRegistered = true), currentUserRole = "owner"...)
+    return true
+}
+
+```
+
+
+This allows anyone to bypass authentication by typing any random characters.
+29. **Staff Screen Allocation Bypass via Direct State Access**: `isScreenAllocated()` only validates when queried by UI components; ViewModel functions like `recordPayment` or `voidTransaction` never verify staff screen permissions before execution.
+30. **`PabaruViewModel.deleteManagedUser` Does Not Cascade to Database Transactions**: Deleting a managed user leaves orphan records in `transactions` and `parties` linked to that store code.
+31. **`impersonateUser` State Pollution**: When switching stores via impersonation, if `isCurrentStore` is false, it clears `transactions` in memory but leaves `parties`, `products`, and `bankAccounts` from the previous store active.
+32. **`PabaruViewModel.signOut` Incomplete State Clearing**: `signOut()` only sets `isRegistered = false`, leaving tenant cash balances, party ledgers, and transactions in memory, leaking confidential data on shared devices.
+33. **Missing ViewModel Coroutine Cancellation on Scope Exit**: Dispatched background tasks in `viewModelScope` calling `database?.productDao()?.updateStock` do not catch `CancellationException`, risking suppressed cancellations.
+34. **`PabaruViewModel.updateProfile` Does Not Persist to Room**: `updateProfile` updates `_uiState` and records an audit log, but never calls `businessProfileDao().insertOrUpdateProfile()`. Changes are lost on app restart.
+35. **`PabaruViewModel.addParty` Lacks Deduplication**: Adding a party with an identical phone number or GSTIN inserts duplicate records into `parties`.
+36. **`PabaruViewModel.addProduct` Lacks Barcode Uniqueness Guard**: Multiple products can be created with identical barcodes, causing POS scanner collisions.
+37. **`PabaruViewModel.updateProductStock` Allows Negative Stock**: While `coerceAtLeast(0)` prevents negative stock, it silently clamps values without logging an inventory shrinkage audit event.
+38. **Manager Lockout Timer Reset on Device Reboot**: `managerLockoutUntilTimestamp` is held only in memory (`_uiState`); rebooting the phone resets failed PIN attempts to 0 and clears the lockout.
+39. **`verifyManagerPin` Flawed Lockout Check**: Once `managerLockoutUntilTimestamp` expires, `managerFailedAttempts` is not reset to 0, meaning the very next failed attempt immediately locks out the user again for maximum duration.
+40. **`unlockManagerWithFingerprint` Fails to Check Biometric Crypto Object**: Fingerprint unlock is performed via software flag without validating a `BiometricPrompt.AuthenticationResult.cryptoObject` signature, making it vulnerable to hooked biometrics.
+41. **`PabaruViewModel.setThemeMode` Main Thread Disk I/O**: `context.getSharedPreferences().edit().putString().apply()` is called on the main thread inside UI events; while `apply()` is asynchronous, initial XML reads can cause frame drops.
+42. **`PabaruViewModel.recordPayment` Negative Amount Vulnerability**: `recordPayment` accepts any `Long` value; passing a negative number inverts credit/debit totals in the ledger.
+43. **`PabaruViewModel.recordQuickCash` Missing Branch ID Validation**: If `activeBranchId` is invalid or deleted, transactions are recorded under non-existent branches.
+44. **`PabaruViewModel.bulkToggleUserStatus` Silent Failure on Empty List**: Calling `bulkToggleUserStatus` with empty store codes updates `lastSyncTimestamp` and logs "Bulk status updated for 0 tenants".
+45. **`PabaruViewModel.triggerLocalSync` Simulated Delay in Production Code**: `kotlinx.coroutines.delay(350)` is hardcoded into `triggerLocalSync()`, freezing execution unnecessarily during UI unit tests.
+
+---
+
+### Section 2: Financial Engine, GST Calculations & Round-Offs (Bugs 46–95)
+
+46. **GST Rule 26 Non-Parity in High-Value Orders**: Splitting odd paise amounts ($0.01) between CGST and SGST using `Math.floor(totalTax / 2)` leaves an unallocated paisa that causes `cgst + sgst != igst` when calculating line items individually versus in bulk.
+47. **`FinancialEngine.calculateGst` Negative Input Returns 0L Silently**: Negative taxable paise return 0L rather than throwing an illegal argument error, allowing negative turnover calculations to be masked.
+48. **`FinancialEngine.calculateGst` Max Tax Rate Uncapped at 100%**: A tax rate of 100% is allowed by `coerceIn(0, 100)`, but Indian statutory GST rates are strictly bounded to 0%, 0.1%, 0.25%, 1.5%, 3%, 5%, 12%, 18%, and 28%.
+49. **Missing 0.25% & 3% Precious Metals / Diamond GST Slabs**: Indian GST mandates 0.25% for cut diamonds and 3% for gold/silver jewellery; integer `gstRate: Int` cannot represent 0.25% or fractional rates.
+50. **Integer Division Truncation in GST Fractional Rates**: Because `gstRate` is defined as `Int` throughout Kotlin data classes, fractional GST slabs like 0.25% and 0.1% cannot be processed without truncating to 0%.
+51. **HSN Statutory Code Length Regex Fails on 2-Digit Service Groups**: Statutory rules permit 2-digit SAC for certain small service providers under composition or exempt categories, but `validateHsn` rejects 2 digits outright.
+52. **HSN Validation Permits Alphabetic Characters in Web Engine**: In `app.js`, HSN regex allows plain string input before invoice save, whereas Kotlin validates digits strictly, causing cross-platform sync failures.
+53. **`FinancialEngine.sanitizeDecimalInput` Corrupts Double-Dot Formats**: For input `"100..50"`, it drops the second dot and outputs `"100.50"`, guessing user intent instead of rejecting malformed input.
+54. **`parsePaiseFromRupees` Floating-Point Multiplication Error**: `(d * 100.0).toLong()` suffers from IEEE 754 precision issues (e.g. `29.99 * 100.0 = 2998.9999999999995`, which converts to `2998L` instead of `2999L`).
+55. **`amountInWords` Overflow on Figures $\ge 100$ Crores**: Indian numbering systems beyond Crore (e.g., Arab, Kharab) fall through to the `else` branch, appending `numToWords(n / 10000000) + "Crore "`, which loops incorrectly for numbers exceeding 100 Crores.
+56. **`amountInWords` Negative Paise Returns "Zero Rupees Only"**: Passing negative paise returns "Zero Rupees Only" instead of indicating "Minus / Negative Balance".
+57. **`amountInWords` Grammatical Error for Single Rupee**: Output for 100 paise is `"Rupees One Only"`; standard financial convention specifies `"Rupee One Only"`.
+58. **`amountInWords` Grammatical Error for Single Paisa**: Output for 1 paisa is `"and One Paise Only"`; grammatically it should be `"and One Paisa Only"`.
+59. **`validateGstin` Rejects Valid GSTINs for Embassy / Consular Missions**: GSTINs issued to UN bodies and embassies contain state code `U9` or `99`, which are rejected by the numeric state code check `stateCode.toIntOrNull() in 1..38`.
+60. **`validateGstin` Checksum Digit Verification Missing**: `validateGstin` checks regex syntax only and does not compute the statutory Luhn mod-36 checksum algorithm on the 15th character, allowing fabricated GSTINs.
+61. **`validatePan` Checksum Missing**: Validates PAN format via regex (`[A-Z]{5}[0-9]{4}[A-Z]`) but does not verify the 4th character against applicant classification or check the 5th character against surname initial.
+62. **`validateIfsc` Permits Invalid Bank Codes**: Regex permits any 4 letters followed by `0`, accepting non-existent banks like `ZZZZ0123456`.
+63. **`validatePhone` Allows Repeating Dummy Digits**: Numbers like `9999999999` or `8888888888` pass the regex test without validation against invalid telecommunication ranges.
+64. **Interstate Supply Status Ignored for Special Economic Zones (SEZ)**: Indian GST requires supplies to SEZ developers/units to be treated as Interstate (IGST) even if located within the same state. The engine checks only `state_code != home_state_code`.
+65. **Reverse Charge Mechanism (RCM) Missing**: Invoices do not support an RCM flag; tax on purchases from unregistered suppliers subject to Section 9(3)/9(4) cannot be accounted for.
+66. **TDS / TCS Under GST Unaccounted For**: Section 51 (TDS) and Section 52 (TCS for e-commerce) deductions cannot be recorded in `Transaction` models.
+67. **Missing Cess Calculations**: Goods like tobacco, aerated drinks, and motor vehicles attract statutory Compensation Cess in addition to GST; the model has no `cessPaise` field.
+68. **Discount Application Before vs After GST**: Line items lack a `discountPaise` field. Applying trade discounts manually to `ratePaise` prevents printing pre-discount price and discount percentage on tax invoices.
+69. **Rounding Differences in Invoice Tax Summary**: Tax summary aggregates line item CGST and SGST directly. If an invoice has 10 items with fractional half-paise taxes rounded up, the sum of line item taxes differs from tax calculated on the total taxable amount.
+70. **Credit Note Without Original Invoice Reference**: `Transaction` has no `originalInvoiceNumber` or `originalInvoiceDate` fields, violating Rule 53 of CGST Rules for credit notes.
+71. **Debit Note for Price Escalation Lacks Tax Recalculation**: Debit notes created for value differences cannot recompute tax components separately from items.
+72. **Delivery Challan Functionality Omitted**: Moving goods for job work or branch transfer without sale requires a Delivery Challan under Rule 55; no transaction type exists for this.
+73. **Bill of Supply Issues Tax Breakdowns on Mixed Invoices**: When a composition dealer issues an invoice, web export still renders GST column headers unless explicitly suppressed.
+74. **Inconsistent State Code for Daman & Diu and Dadra & Nagar Haveli**: Post-merger GST state code is `26`; legacy state code `25` is still handled in parts of the validation list, causing mismatches.
+75. **Missing State Code `97` for Other Territory**: GST territory covers maritime zones under code `97`, which is missing from `INDIAN_STATES`.
+76. **P&L Miscalculation on Drawings**: Drawings are subtracted from equity on the Balance Sheet, but cash paid out is logged as `Drawing` which omits contra verification if paid via bank.
+77. **Opening Stock Ignored in Periodic P&L**: In `ReportsView` (`app.js`), `openingStock` uses `profile.opening_stock_valuation || 0`. If a business starts mid-year, this valuation is static and never updates across financial quarters.
+78. **Closing Stock Valuation Does Not Support FIFO/LIFO/Weighted Average**: Inventory valuation is calculated strictly as `current_stock * purchase_price_paise`, assuming uniform cost and ignoring price fluctuations across purchase batches.
+79. **Negative Inventory Valuation on Short Sales**: If stock drops to negative (allowed when billing rapidly without previous purchase entry), stock valuation becomes negative, improperly increasing COGS in the P&L.
+80. **Direct vs Indirect Expense Classification Subjectivity**: Users can save expenses without selecting a category, causing the model to fall back to `Direct`, artificially depressing Gross Profit instead of Operating Profit.
+81. **Depreciation Calculation Absent in Routine Ledger**: While CMA reports include depreciation, the daybook and ledger have no mechanism to post monthly depreciation journal entries.
+82. **Bad Debts Write-Off Mechanism Absent**: Uncollectible customer balances cannot be written off as Bad Debts without creating a dummy "Payment In", artificially inflating receipts.
+83. **Contra Entries Allowed on Same Bank Account**: In `ExampleRobolectricTest.kt`, contra transfers are tested, but transferring from account A to account A is only rejected in test asserts; the engine doesn't validate this across all UI flows.
+84. **Cash Float Adjustment Does Not Validate Drawer Limit**: `adjustCash()` permits adding negative cash without checking if the physical drawer balance falls below zero.
+85. **Outstanding Customer Aging Incalculable**: Transactions do not link payments directly to specific invoices (FIFO invoice matching is absent), making it impossible to calculate 30/60/90-day overdue debtor aging reports.
+86. **Supplier Debit Balance Treated as Negative Liability Instead of Current Asset**: In `ReportsView`, if a supplier is overpaid (advance payment), their negative payable reduces total liabilities instead of being classified under Current Assets as "Advances to Suppliers".
+87. **Customer Credit Balance Treated as Negative Asset**: Customer advance deposits reduce Total Receivables instead of being shown under Current Liabilities as "Advances from Customers".
+88. **Capital Account Does Not Track Fresh Capital Injections**: Any money introduced by the owner during the year is forced into `Payment In`, inflating operational revenue instead of crediting Owner's Capital.
+89. **Missing Trial Balance Validation**: No double-entry verification engine exists to ensure $\sum \text{Debits} == \sum \text{Credits}$ before finalizing accounts for the day.
+90. **Cash Payments Exceeding ₹10,000 Not Flagged**: Section 40A(3) of the Income Tax Act disallows cash expenditure payments exceeding ₹10,000 per day; the app accepts unlimited cash payments without statutory warnings.
+91. **Cash Receipts Exceeding ₹2,00,000 Not Blocked**: Section 269ST prohibits receiving cash of ₹2,00,000 or more from a person in a day or in respect of a single transaction; the app allows saving rapid cash sales of any magnitude.
+92. **E-Way Bill Threshold Warning Absent**: Inter-state or intra-state consignments exceeding ₹50,000 mandate an E-Way Bill; invoices exceeding this value do not display an E-Way bill compliance alert.
+93. **E-Invoicing QR Code Absent for B2B**: Businesses exceeding statutory turnover thresholds must print a signed IRN QR code on tax invoices; the app provides only payment UPI QR codes.
+94. **Bank Reconciliation Lacks Stale Cheque Expiry Tracking**: Cheques in India are valid for 3 months; uncleared cheques in bank recon do not flag as stale after 90 days.
+95. **Bank Charges Lacks Input Tax Credit Breakdown**: Bank service charges and SMS alert fees carry 18% GST which can be claimed as ITC; importing bank statements treats the entire amount as expense without splitting ITC.
+
+---
+
+### Section 3: Web Application, JavaScript Engines & PWA (Bugs 96–145)
+
+96. **`app.js` React 18/19 Root Destruction on Hot Reload**: `ReactDOM.createRoot(document.getElementById('root'))` is executed at the top level of the script; re-running or injecting the script throws `You are calling ReactDOMClient.createRoot() on a container that has already been passed to createRoot()`.
+97. **`localStorage` Quota Exceeded Unhandled**: Saving large base64-encoded PDF or invoice caches into `localStorage` throws `QuotaExceededError`, which is unhandled and causes subsequent state updates to crash.
+98. **Synchronous `JSON.parse` of Tampered LocalStorage Drops State**: In `useState` initializers, `JSON.parse(saved)` is wrapped without `try-catch`; corrupted local storage data causes a white-screen-of-death on app startup.
+99. **`todayInPaise` / `todayOutPaise` Calculations Use UTC Instead of Local IST**:
+```javascript
+const todayStr = new Date().toISOString().split('T')[0];
+
+```
+
+
+Between 00:00 AM and 05:30 AM IST, `todayStr` represents the previous day in UTC, causing all morning transactions in India to vanish from "Today's In / Out" summary cards.
+100. **`InvoiceBuilderView` Missing Line Item Unique Keys**: Inside line item iteration, `calculatedItems.map((item, idx) => <tr key={idx}>)` uses array index as key. Deleting a row mid-list causes React DOM state bugs where input values shift to wrong items.
+101. **`InvoiceBuilderView` Item Selection Overwrites Custom Price**: When changing `item_id`, the rate is automatically overwritten with `prod.sale_price_paise`, wiping out negotiated pricing or custom rates without confirmation.
+102. **`InvoiceBuilderView` Quantity Clamped to 1 Prevents Decimal Weights**: `Math.max(1, parseInt(e.target.value) || 1)` forces integers only, preventing retail grocery items sold in fractions (e.g. 1.5 kg or 0.250 kg).
+103. **`QuickCashKeypadView` Number Display Leading Zero Glitch**: Typing `'00'` when display is `'0'` produces `'000'` instead of remaining `'0'`.
+104. **`QuickCashKeypadView` Multiple Decimal Points Allowed**: Rapidly clicking or typing decimals can create invalid floating strings like `"100.50.25"`.
+105. **`QuickCashKeypadView` Negative Rupee Values Allowed via Paste**: Pasting a negative string into remarks or amount field passes into state and corrupts drawer balance.
+106. **`PartiesKhataView` Modal State Not Reset on Cancel**: Typing half a party's details and clicking "Cancel" retains stale inputs when reopened.
+107. **`ProductsStockView` Numeric Inputs Accept Exponential Characters (`e`, `E`)**: Standard HTML `<input type="number">` allows typing `"1e5"`, causing `parseInt` to fail or produce distorted stock valuations.
+108. **`OfflineUpiQr` SVG Memory Leak**: Calling `qrRef.current.innerHTML = ''` without destroying existing `window.QRCode` instances leaks DOM nodes and canvas listeners on each re-render.
+109. **`OfflineUpiQr` Missing Amount Parameter Encoding**: UPI string generates `upi://pay?pa=...&cu=INR` without `&am=` amount specification when generating counter QR codes for specific bills, forcing customers to enter amounts manually.
+110. **`ReportsView` Direct Expenses Hardcoded Filter**: Checks `t.expense_category === 'Direct'`; if a transaction has `expenseCategory` (camelCase) from Android sync, it is missed and drops into the void, corrupting Net Profit.
+111. **`CrossPlatformView` Self-HTML Download Drops External Styles**: `document.documentElement.outerHTML` downloads the DOM structure, but linked vendor scripts loaded via CDN fail to render when opened offline on a laptop without internet.
+112. **`export_engine.js` `generateInvoicePdf` AutoTable Y-Position Collision**: `doc.lastAutoTable.finalY` can be `undefined` if AutoTable plugin fails to register correctly, throwing a fatal error on invoice download.
+113. **`export_engine.js` Missing Font for Indian Rupee Symbol (₹)**: jsPDF standard 14 fonts (Helvetica, Times) do not include the Unicode character `₹` (U+20B9), printing garbled characters or `?` instead of currency symbols.
+114. **`export_engine.js` WhatsApp URL Phone Number Stripping Flaw**:
+`javascript while (cleanPhone.startsWith('0')) cleanPhone = cleanPhone.substring(1); `
+If a mobile number has international prefix errors or spaces, string operations can slice numbers below 10 digits, sending messages to invalid numbers.
+115. **`crypto_engine.js` `canonicalJsonStringify` Circular Reference Crash**: If a transaction object contains circular references (e.g., from an event target or parent pointer), recursion crashes with `Maximum call stack size exceeded`.
+116. **`crypto_engine.js` Sub-Object Array Sorting Flaw**: In `canonicalJsonStringify`, arrays of objects are mapped without sorting array elements; if two peers generate identical line items in different order, hashes diverge.
+117. **`crypto_engine.js` Window Object Attachment Conflict**: Attaches to `window.CryptoEngine` directly; running in headless Web Workers or Jest Node environments crashes with `window is not defined`.
+118. **`store.js` `formatPaise` Compact Lakh/Crore Formatter Negative Sign Inversion**: For negative numbers between -999 and 0, string formatting produces `-  -0.50` with duplicated minus signs.
+119. **`store.js` `formatPaise` Indian Comma Regex Failure on Small Numbers**: Numbers under 1,000 with 4 digits (e.g. 1000) can format as `,1,000.00` if string length calculations misalign.
+120. **`store.js` `rupeesToPaise` Negative Input Returns 0**: Converts negative balances to 0, hiding supplier debit balances.
+121. **`store.js` `resolveConflictLWW` Clock Skew Flaw**: Peer devices with skewed hardware clocks can overwrite newer records indefinitely because resolution depends strictly on local timestamps.
+122. **`store.js` `mergeCollectionLWW` Omits Deletion Tombstones**: If an item is deleted on device A, device B merges it right back because no tombstone record exists to represent deletion.
+123. **`index.html` Missing Safe-Area Inset Handling on Android 15/16**: CSS variable `--sat` defaults to `0px` if `env()` is unsupported or disabled in custom WebViews, cutting off top status bar content.
+124. **`index.html` Missing Viewport Fit Cover on Foldables**: Lacks CSS media rules for dual-screen foldables, causing asymmetrical padding in landscape POS mode.
+125. **`index.html` Script Tag CDN Fallback Fails on Blocked Networks**: `onerror` triggers a fallback CDN URL, but if the device is in an offline shop environment, the CDN also fails, leaving the web app unstyled and broken.
+126. **Theme Color Switching Glitch in Web Interface**: Switching themes updates data attributes, but CSS variables inside inputs and SVG icons do not invalidate immediately in legacy WebView versions.
+127. **Double Tap Zoom Glitch in POS Mode**: Despite `user-scalable=no`, Chrome on Android still enables double-tap-to-zoom on rapid number pad button taps, breaking keypad responsiveness.
+128. **Form Autofill Interferes with POS Numpad**: Inputs lack `autocomplete="off"` and `autocorrect="off"`, triggering Android keyboard suggestions over the custom quick keypad.
+129. **Print Media Query Overrides Thermal Paper Width**: `@media print` defines `body { background: white; color: black; }` but omits `@page { size: 80mm 297mm; margin: 0; }`, formatting receipts for A4 paper and printing illegibly on 2-inch and 3-inch POS thermal rolls.
+130. **Missing Web App Manifest**: PWA prompt in `CrossPlatformView` instructs users to install the app, but no `manifest.json` is linked in `index.html`.
+131. **Missing Service Worker**: No service worker is registered in `index.html`, meaning web assets are not cached by the browser cache engine, preventing true offline browser usage.
+132. **Web Crypto API Incompatibility on Insecure Origins**: `crypto.subtle` is undefined when accessing via plain HTTP or local network IP addresses (`[http://192.168.](http://192.168.)x.x`), crashing audit chain operations on local LAN deployments.
+133. **Missing CSP (Content Security Policy)**: `index.html` contains no CSP meta tag, allowing injected inline scripts or unvetted external scripts to execute.
+134. **`app.js` Toast Notification Overwrite**: Calling `showToast` twice in quick succession clears the first toast prematurely without queuing messages.
+135. **Invoice Print Action Triggers Page Reload**: In certain WebViews, calling `window.print()` halts JavaScript timers, stalling background ledger sync.
+136. **`app.js` Restock Product Allows Negative Increments**: `handleRestockProduct` accepts negative values, enabling accidental stock reductions.
+137. **Party Ledger Statement Missing Page Numbers**: `generatePartyLedgerPdf` in `export_engine.js` creates multi-page statements without drawing page numbers or running headers on subsequent pages.
+138. **Party Ledger Statement Date Sorting Bug**: Transactions are filtered by party but not sorted by date before generating running balances, mixing balance forward calculations if entered out of order.
+139. **HSN Table Head Styles Background Color Overlap**: In `export_engine.js`, `doc.autoTable` head style colors do not match PDF theme specifications across different themes.
+140. **Missing Customer Signature Box in Tax Invoice**: CGST rules require customer signature acknowledgment for credit sales exceeding certain amounts; the invoice template only provides a supplier signature block.
+141. **Cash In Hand Disregards Opening Cash Balance in Daybook**: The daybook view calculates daily inflows and outflows, but does not display the opening cash drawer float at the start of the business day.
+142. **`exportToExcel` Fails on Special Characters in Sheet Name**: If `businessProfile.business_name` contains characters like `[`, `]`, `*`, `?`, `:`, or `/`, SheetJS crashes because Excel forbids them in tab names.
+143. **`exportToExcel` File Extension Duplication**: Calling `exportToExcel(data, "Report.xlsx")` appends `.xlsx` again, producing `"Report.xlsx.xlsx"`.
+144. **Quick Cash POS Does Not Support Splitting Bills**: Counter transactions cannot be split between part cash and part UPI; cashiers are forced to enter two separate transactions manually.
+145. **Party Khata Phone Call Deep-Link Missing**: Clicking a customer or supplier card provides no direct `tel:` intent to dial their number directly from the app.
+
+---
+
+### Section 4: Export Engine, PDF Generation & Native Android Bridges (Bugs 146–195)
+
+146. **`ExportEngine.kt` Canvas Bitmap Density (DPI) Inconsistency**: `PdfDocument` uses 72 DPI (PostScript points), but coordinates are drawn with hardcoded pixel coordinates, causing distorted margins on high-DPI tablets.
+147. **`ExportEngine.kt` Paint Text Size Not Scaled with Density**: Hardcoded text sizes (e.g. `14f`, `8.5f`) render with different relative proportions across Android screen densities if drawn to bitmaps prior to PDF rendering.
+148. **`ExportEngine.kt` Check Page Break Leaves Orphan Table Headers**: If page break triggers right after drawing a section header, the header is printed alone at the bottom of the page while table data appears on the next page.
+149. **`ExportEngine.kt` Missing Auto-Wrap on Long Company Names**: If `profile.businessName` is 60+ characters, it draws straight off the right edge of the PDF page without wrapping.
+150. **`ExportEngine.kt` Missing Page Break Check in Buyer Box**: If party address is multiple lines long, it overlaps the table header starting at `y = 185f`.
+151. **`ExportEngine.kt` HSN Table Header Alignment Glitch**: Column headers for "Taxable Value" and "Total Tax" are centered while numerical cell contents are left-aligned, creating misaligned columns.
+152. **`ExportEngine.kt` Auto Round-Off Text Overlap with Large Amounts**: If invoice grand total is in Crores, `FinancialEngine.formatPaise` produces long strings that collide with the statutory description text on the left.
+153. **`ExportEngine.kt` Missing Rupee Symbol in Native Canvas**: `Paint.drawText("  ", ...)` fails to render the rupee symbol if the Android system font lacks the glyph, drawing an empty square/tofu box.
+154. **`ExportEngine.kt` Authorized Signatory Overlaps Footer on Long Invoices**: If line items end at `y = 740f`, `sigY = y + 120f` computes to `860f`, which exceeds page height `842f` and gets clipped off the page.
+155. **`ExportEngine.kt` Cache File Collision**: Cache files are named `Invoice_${safeDocName}.pdf`. If two invoices have the same sanitized number, the second overwrites the first during simultaneous shares.
+156. **`ExportEngine.kt` Missing Temporary File Cleanup**: Generated PDF files in `context.cacheDir` are never deleted, filling internal storage over time.
+157. **`ExportEngine.kt` FileProvider Authority Hardcoding**: Uses `"${context.packageName}.provider"`. If an application builds under a different applicationId or flavor (e.g., debug), FileProvider crashes with `IllegalArgumentException: Failed to find configured root`.
+158. **`ExportEngine.kt` Missing Read Permission on Share Intent**: For certain third-party mail and messaging clients, `addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)` must be accompanied by `ClipData.newRawUri` to grant permissions reliably.
+159. **`ExportEngine.kt` Missing Activity Not Found Protection**: Calling `context.startActivity(Intent.createChooser(...))` without checking if an app handles PDF sharing throws `ActivityNotFoundException` on stripped devices.
+160. **`ExportEngine.kt` WhatsApp Reminder Missing International Code Validation**: If phone is `09820011223`, slicing leaves `9820011223`, but does not prepend `91` consistently across all branches.
+161. **`ExportEngine.kt` WhatsApp Direct Intent Failure**: Target package `"jid", "$cleanPhone@s.whatsapp.net"` fails if WhatsApp is not installed; it does not fall back to standard web URLs or WhatsApp Business (`com.whatsapp.w4b`).
+162. **`ExportEngine.kt` Missing UTF-8 URL Encoding on WhatsApp Message**: Rupee symbol and linebreaks in WhatsApp reminder are passed into `Intent.EXTRA_TEXT` as raw strings; on older Android versions, special symbols can be dropped.
+163. **`ExportEngine.kt` CMA Report Division by Zero on Total Outlay**:
+`kotlin fun pct(amt: Long) = if (totalOutlay > 0) String.format("%.1f%%", (amt.toDouble() / totalOutlay) * 100.0) else "0.0%" `
+If `totalOutlay` is 0, it returns `"0.0%"`, but downstream debt-service ratio calculations divide by 0 and emit `NaN` and `Infinity`.
+164. **`ExportEngine.kt` CMA Report Page 2/3 Alignment Drift**: `colX = listOf(160f, 260f, 360f, 460f)` leaves only 100 points per column; when figures exceed ₹10 Crores (e.g. `  12,50,00,000.00`), adjacent columns overlap.
+165. **`ExportEngine.kt` CMA Report Missing Page Number Totaling**: Total pages is computed as `if (projectReport != null) 3 else 2`, but if the Operating Statement overflows into multiple pages due to extended schedules, the page count is wrong.
+166. **`ExportEngine.kt` CMA Report Benchmark Comparisons Missing Dynamic Indicators**: Benchmark values like `Current Ratio >= 1.33` are static text and do not flag when actual ratios fall below bank approval norms.
+167. **`ExportEngine.kt` CMA Report WhatsApp Share Exceeds URI String Limits**: WhatsApp message text built via `buildString` can exceed maximum intent extra payload limits on low-memory devices, resulting in transaction crashes.
+168. **Missing Native JavaScript Interface Bridge Implementation**: `export_engine.js` checks `window.AndroidBridge` and `window.PabaruNativeBridge`, but no `@JavascriptInterface` class is registered on the WebView in `MainActivity.kt`.
+169. **Thermal Printer ESC/POS Byte Stream Missing**: No module exists to output direct ESC/POS byte commands for Bluetooth or USB thermal receipt printers.
+170. **PDF Page Size Fixed to A4**: POS counter receipts cannot be printed on 58mm or 80mm continuous roll paper from the Android engine.
+171. **Missing Document Metadata in PDF**: Generated PDFs omit Title, Author, Subject, and Creator metadata, causing compliance warnings in document archiving systems.
+172. **PDF Output Stream Not Flushed Before Closing**: `FileOutputStream.use` closes the file, but on some virtualized storage systems, unwritten buffer caches can result in 0-byte PDF files.
+173. **Unsanitized File Provider Paths in `file_paths.xml**`: Root path `path="."` in `cache-path`, `files-path`, and `external-cache-path` grants external access to all application files.
+174. **Inconsistent Line Delimiters in Text Export**: Android uses `\n`, while Windows Excel exports require `\r\n`, causing daybook text exports to display on a single line in Windows Notepad.
+175. **Missing CSV Escaping for Commas in Party Names**: When generating CSVs manually, party names containing commas (e.g. `"Balaji Kirana, Dadar"`) split across two columns.
+176. **Missing Excel BOM for UTF-8**: Exporting CSV files without a UTF-8 Byte Order Mark (`\uFEFF`) causes Microsoft Excel to open files with corrupted currency symbols and Devanagari text.
+177. **Missing Share Intent Chooser Title Localization**: Chooser titles like `"Share Invoice PDF"` are hardcoded in English, ignoring device locale.
+178. **Missing Intent Flag `FLAG_ACTIVITY_NEW_TASK**`: Calling `context.startActivity` from non-activity contexts throws `AndroidRuntimeException`.
+179. **Draw Wrapped Text Infinite Loop on Words Exceeding Max Width**: If a single continuous word or URL is wider than `maxWidth`, `drawWrappedText` fails to advance lines properly.
+180. **Draw Wrapped Text Drops Final Word**: If `paint.measureText(candidate) > maxWidth`, `curLine` is updated but not flushed if loop finishes on line count limit.
+181. **PDF Canvas Antialiasing Disabled for Geometric Paths**: `paint.isAntiAlias = true` is set, but borders drawn with `canvas.drawLine` appear jagged on low-resolution printer rasters.
+182. **Hardcoded Color RGB Values Ignore System Dark Theme**: PDF generation hardcodes white backgrounds and dark text, ignoring app design tokens.
+183. **HSN Summary Table Does Not Group by SAC Code**: Service invoices using SAC codes (e.g., `998311`) are labeled as "HSN" without the statutory "SAC" designation.
+184. **Bank Details Block Does Not Print Bank Branch Name**: Only `bankName` is printed; bank branch location is omitted, complicating NEFT transfers.
+185. **Missing Composition Scheme Declaration Text**: Composition invoices are legally required to print: *"Composition taxable person, not eligible to collect tax on supplies"*; this statutory text is absent.
+186. **Missing Original/Duplicate/Triplicate Stamp**: Tax invoices must state whether the copy is *"Original for Recipient"*, *"Duplicate for Transporter"*, or *"Triplicate for Supplier"*.
+187. **Invoice Time Omitted from Date Field**: Only `YYYY-MM-DD` is printed; audit compliance for e-way checks requires recording invoice generation time.
+188. **Party PAN Printed as "N/A" Even When GSTIN Present**: If party PAN is blank, it prints "N/A" even though characters 3 to 12 of their GSTIN contain the PAN.
+189. **Taxable Amount Calculation Disregards Item-Level Freight**: Invoices do not distribute freight/packaging charges proportionally across items to determine taxable value.
+190. **Vehicle Number Omitted from Invoice**: Goods transport requires recording vehicle registration numbers; no field exists in the invoice header.
+191. **Terms and Conditions Block Omitted**: Standard terms (interest on delayed payment, Mumbai jurisdiction) are absent from printed invoices.
+192. **Missing Barcode/QR Code on Printed Physical Invoice**: B2C invoices do not include a dynamic UPI QR code on the physical printed canvas.
+193. **CMA Report DSCR Ratio Allows Division by Zero**: If repayment obligation is zero, DSCR computes to `Infinity` on the PDF statement.
+194. **CMA Statement EBITDA Does Not Add Back Interest**: If operating profit calculation misses interest add-backs, debt coverage is artificially depressed.
+195. **Bank Recon Report Omitted from Export Engine**: Users can reconcile bank feeds on screen, but cannot export a signed BRS (Bank Reconciliation Statement) to PDF.
+
+---
+
+### Section 5: Security, RBAC, PIN Verification & Audit Chain (Bugs 196–245)
+
+196. **Insecure Storage of Recovery Phrase**: `recoveryPhrase` is written to `localStorage` in plaintext under key `pb_recovery_phrase`, allowing anyone with physical access to read it via browser developer tools.
+197. **Plaintext PIN in SharedPreferences**: In `PabaruViewModel.kt`, `securityPin` is passed as raw text and stored without secondary encryption.
+198. **Staff PIN Hardcoded in Test Logic**: Tests and demo handlers use hardcoded PIN `"1234"` for staff, which is easily guessed if left active in production.
+199. **Manager PIN Salt Length Too Short**: In `resetManagerPinAfterDeviceAuth`, salt is generated as `"PabaruSalt${System.currentTimeMillis()}"` instead of cryptographically secure random bytes, making it predictable.
+200. **Salt Exposed in Exported JSON Backup**: `encryptData` exports `salt` and `iv` in cleartext; while required for decryption, lack of key stretching allows dictionary attacks against 4-digit PINs.
+201. **PBKDF2 Iteration Count Insufficient for 4-Digit PINs**: 100,000 iterations of SHA-256 takes <5 milliseconds per attempt; an attacker can exhaust all 10,000 possible 4-digit PINs in under 50 seconds.
+202. **Audit Log Deletion via Direct SQLite Query**: `AuditLogDao` lacks SQLite write-protection triggers; an attacker with rooted access can delete rows without breaking foreign keys.
+203. **Audit Hash Chain Verifier Can Be Truncated**: `verifyAuditChain` iterates through provided logs; if the last $N$ logs are deleted, the remaining chain still passes because it validates forward from Genesis.
+204. **Tampered Logs Detectable But Not Recoverable**: When `corruptedIndex` is identified, the app halts verification without providing a mechanism to restore the pre-tampered ledger state.
+205. **Audit Trail Missing Device ID / Android ID**: Audit logs identify `actor` by name string (e.g. `"Owner"`), making it impossible to determine which physical device made an entry in multi-counter setups.
+206. **Staff User Session Fixation**: Switching users in `switchUserRole` does not terminate existing auth tokens or clear view models.
+207. **Unrestricted Access to Audit Logs by Staff**: Staff users can open the "Audit & Backup" screen if tab restrictions are circumvented.
+208. **Backup JSON File Missing Integrity Signature**: The exported `.pabaru` backup file does not include an HMAC signature; an attacker can alter ciphertext and cause decryption padding errors.
+209. **Plaintext JSON Backup Fallback**: If PIN protection is not set, `onExportBackup` exports all business ledgers, customer details, and transactions in unencrypted plaintext JSON.
+210. **Super Admin Mode Accessible via System Clock Manipulation**: Bypassing lockouts by moving the device clock forward works because lockout checks use `System.currentTimeMillis()`.
+211. **Master PIN Verification Prone to Timing Attacks**: `CryptoEngine.hashPinString(trimmed, ...) == expectedHash` uses standard string equality (`==`) rather than constant-time comparison (`MessageDigest.isEqual`), opening side-channel timing attacks.
+212. **Biometric Bypass on Configuration Change**: If orientation changes while `BiometricPrompt` is visible, the dialog can dismiss and leave the UI in an indeterminate auth state.
+213. **Screen Capture Allowed in Secure Screens**: `MainActivity` does not set `WindowManager.LayoutParams.FLAG_SECURE`, allowing background screenshots and screen recording of customer khata and PIN entries.
+214. **Clipboard Leakage of 12-Word Phrase**: The recovery phrase displays with `select-all` class, allowing clipboard sniffers to read the ledger recovery key.
+215. **Lack of Root Detection**: The app executes on rooted Android devices without checking for `su` binaries or unlocked bootloaders, exposing encrypted databases to memory extraction.
+216. **Intent Redirection in File Sharing**: `ExportEngine` launches `ACTION_SEND` intents without restricting `setPackage` or verifying component targets, exposing data to malicious intent interceptors.
+217. **File Provider Permissions Granted Broadly**: In `AndroidManifest.xml`, `grantUriPermissions="true"` on the FileProvider coupled with root paths grants receiving apps access beyond the target PDF.
+218. **Missing Signature Check on SQLite Database**: pabaru_billing.db is not encrypted using SQLCipher; extracting the file via ADB backup exposes all transaction records.
+219. **Plaintext Logging of Financial Actions**: Audit record details log `totalPaise / 100` alongside customer phone numbers, exposing PII in logcat outputs.
+220. **Unchecked Impersonation in Super Admin**: `impersonateUser` switches to any tenant store code without verifying administrative privileges or checking an authorization token.
+221. **Tenant Isolation Breach in Room Database**: All tenants share the same `transactions` and `parties` tables without tenant ID isolation columns in Room entities.
+222. **Staff Permission Tampering via JavaScript Console**: In the web interface, modifying `permissions.canVoidTransactions = true` in the browser console bypasses void restrictions immediately.
+223. **Lack of Re-Authentication for Voiding**: Voiding an audited invoice requires an explanation string, but does not prompt for the Manager or Owner PIN to confirm identity.
+224. **Void Reason Base64 Collision Vulnerability**: Sanitizing reasons with `btoa` without URI component encoding corrupts non-ASCII Hindi/Devanagari characters entered as void reasons.
+225. **Missing Rate-Limiting on Master PIN Verification**: Users can attempt infinite PIN entries against `verifyMasterPin` because lockout logic only applies to `verifyManagerPin`.
+226. **Replay Attack on Audit Logs**: If an audit record is duplicated and injected with an identical hash, verification detects a duplicate but cannot determine which one is legitimate.
+227. **Missing Hardware Security Module (HSM) / KeyStore Integration**: Master keys are derived via software PBKDF2 instead of leveraging Android Keystore (Tee/StrongBox).
+228. **Staff Deactivation Takes Effect Only on Next Login**: If an active staff member is deactivated in Super Admin, their ongoing session is not invalidated until they manually log out.
+229. **Unbounded Audit Log Growth**: Audit logs are never archived; after 100,000 transactions, Genesis hash verification traverses the entire chain sequentially, hanging the UI thread on load.
+230. **Windowed Audit Verification Skips Intermediate Chain Blocks**: `verifyAuditChainWindowed` verifies only the last `windowSize` entries, failing to detect tampering that occurred prior to the window start.
+231. **Known Anchor Invalidation Without Alert**: If a known anchor hash does not match, `verifyAuditChainWindowed` falls back to index 0 without raising an alarm.
+232. **Cryptographic Salt Truncation**: In `resetManagerPinAfterDeviceAuth`, `salt` is derived from timestamps; timestamp granularity allows attackers to precompute hash tables within a narrow time window.
+233. **Missing Session Expiry for Inactive Web Counters**: Leaving the browser POS open overnight leaves the counter authenticated indefinitely without an auto-lock timer.
+234. **Plaintext Store Code in Header**: Store code is prominently displayed in the top header, allowing walk-by observers to use it on the staff login portal.
+235. **Staff PIN Entry Uses Password Field Without Scrambled Keypad**: Numeric keypads on Android show touch ripple feedback, allowing screen observers to reconstruct PINs via touch location analysis.
+236. **QR Activity Log Previous Hash Truncation**: `QrActivityLog` truncates previous hashes to 8 characters (`hash.take(8)`), increasing collision probabilities to $1 \text{ in } 2^{32}$.
+237. **Manager Lockout Duration Inconsistent**: Lockout durations (30s, 5m, 30m) are stored in code but not synchronized across multi-counter devices.
+238. **Unrestricted Access to Standalone HTML Download**: Any cashier can click "Download Standalone Single-File Web App" and walk away with the entire application source code and ledger logic.
+239. **Incomplete Audit Detail Tracking on Customer Edit**: Modifying a party's phone number or address records `UPDATE` but does not log a diff of changed fields.
+240. **Missing Tamper Alert Hook**: When `auditVerifyResult.valid` is false, the app displays a bouncing badge but does not disable transactional capabilities, allowing billing to continue on a compromised ledger.
+241. **Audit Hash Delimiter Collisions in Numeric Amounts**: `buildAuditPayloadString` concatenates raw unescaped values; if an entity ID contains a pipe character, hash verification fails.
+242. **Unvalidated JSON Deserialization in Backup Restore**: Restoring backups via `decryptData` uses `JSON.parse` directly; malicious backup files can inject proto pollution payloads.
+243. **Lack of Inactivity Watchdog in Native App**: While `autoLockMinutes` is defined in state, no Android lifecycle timer monitors user inactivity to lock the app automatically.
+244. **Fingerprint Auth Allowed Even When Biometrics Enrolled Changed**: The app does not invalidate biometric authentication when a user adds a new fingerprint in Android system settings (`setInvalidatedByBiometricEnrollment(true)` is missing).
+245. **Super Admin Session Flag Persists Across App Backgrounding**: Minimizing the app while in Super Admin mode leaves the session active when reopened, without prompting for master PIN re-entry.
+
+---
+
+### Section 6: User Interface, Jetpack Compose, Views & State Flow (Bugs 246–295)
+
+246. **Jetpack Compose Edge-to-Edge Clipping with System Gestures**: `safeDrawingPadding()` applied to the root container causes nested scrollable screens to double-pad bottom navigation bars.
+247. **`collectAsStateWithLifecycle` Missing Initial Value Configuration**: If state flow emissions lag, screens render transient default values, causing screen flickers on opening.
+248. **Compose Theme Recomposition Loop**: In `MainActivity.kt`:
+`kotlin val resolvedTheme = remember(uiState.themeMode, uiState.currentTheme, isSystemDark) { ... } `
+If `setThemeMode` triggers recomposition while `updateSystemDarkTheme` is also emitting, the theme triggers back-to-back layout passes.
+249. **Missing Scaffold Padding Insets Consumption**: Custom screens using `Scaffold` do not consume `innerPadding`, causing content to render underneath the top app bar or bottom bar.
+250. **Missing Unmerged Tree Tags in Robolectric Unit Tests**: Tests rely on `useUnmergedTree = true` for tags like `tab_gstr3b_button`; if Compose merges semantics, tests fail with `NodeNotFoundException`.
+251. **LazyColumn Items Missing Unique Stable Keys**: In `SuperAdminScreen`, tenant cards are rendered inside `LazyColumn` without `key = { it.storeCode }`, causing incorrect animation states on item removal.
+252. **Dialog Back Press Dismissal Glitch**: Modals like `showVoidModal` and `showLoginModal` lack hardware back-press handlers, trapping users if dismissal gestures are blocked.
+253. **Text Field Virtual Keyboard Obscuration**: In `InvoiceBuilderView`, adding more than 5 line items pushes the rate and quantity fields underneath the soft keyboard because container lacks `imePadding()`.
+254. **Dropdown Menu Clipping in Scrollable Containers**: State and GST rate selection dropdowns clip at the edge of cards when parent containers have `overflow: hidden`.
+255. **Rapid Double-Click Triggers Multiple Invoices**: The "Generate & Save Invoice" button lacks debouncing; rapid double-tapping submits two duplicate invoices with distinct IDs.
+256. **Daybook Table Horizontal Scroll Missing Scroll Indicator**: On mobile screens, the daybook table extends beyond the screen width without a visual scroll indicator, causing users to miss the Credit/Debit and Action columns.
+257. **Missing Feedback on Empty Daybook Search**: Searching for a non-existent party renders a blank screen without an "Empty search results" placeholder.
+258. **Color Contrast Failure in AMOLED Theme**: In `amoled_black`, secondary text uses `#9CA3AF` on `#0B0B0B`, which fails WCAG AA 4.5:1 contrast standards for small text sizes.
+259. **Status Bar Icon Color Inversion Bug**: In `Theme.kt`, `isAppearanceLightStatusBars` is computed based on `isHeaderDark`; for custom dynamic themes, status bar text becomes invisible against dark backgrounds.
+260. **Missing Content Descriptions for Accessibility**: Navigation icons in `aside` lack localized `contentDescription` attributes, failing Google Play accessibility audits.
+261. **Text Overflow in Mobile POS Keypad**: Keypad buttons with large labels like `Record Cash Entry (₹1,00,000.00)` overflow on 320dp width screens, cutting off the amount.
+262. **Hardcoded English Strings in `strings.xml**`: Application layout strings and error messages are hardcoded in English, lacking Hindi (`values-hi`), Marathi (`values-mr`), or Gujarati (`values-gu`) localizations.
+263. **Unused Icons and Libraries in `build.gradle.kts**`: Commented-out dependencies like `camera-camera2`, `coil-compose`, and `accompanist-permissions` inflate build configuration complexity without purpose.
+264. **Missing Haptic Feedback on Keypad Taps**: Rapid POS counter billing lacks Android haptic click feedback (`HapticFeedbackConstants.KEYBOARD_TAP`), causing cashier input errors.
+265. **Floating Action Bar Obscures Last Row in Super Admin Screen**: In bulk mode, the floating bottom action bar renders on top of the final tenant item in the list, preventing its selection.
+266. **Missing Empty State Illustration for Stock Screen**: An empty inventory displays a stark empty table without an "Add your first product" onboarding card.
+267. **Invoice Preview Scaling Issue on Small Displays**: The invoice layout preview uses fixed CSS widths; on 5-inch mobile screens, tables shrink to unreadable font sizes.
+268. **Parties Card Lena Hai / Dena Hai Badge Color Ambiguity**: In certain light themes, the amber badge for "Lena Hai" looks indistinguishable from the grey badge for "Dena Hai".
+269. **Missing Swipe-to-Delete on Transaction Rows**: Transactions can only be voided via explicit button taps; standard mobile swipe gestures are not supported.
+270. **Quick Cash Screen Amount Display Overflow**: Typing an 8-digit amount causes text to wrap and break layout bounds on small phones.
+271. **Scroll State Lost on Screen Rotation**: Rotating the device while filling an invoice resets line item scroll positions, forcing cashiers to scroll back down.
+272. **Missing Pull-to-Refresh on Daybook**: Daybook register has no pull-to-refresh gesture to re-query Room or re-calculate ledger states.
+273. **Modal Dialog Animation Lag**: Fixed inset backdrop blur animations drop frames on low-end MediaTek/Snapdragon budget devices.
+274. **Inconsistent Button Corner Radii**: Some UI elements use `rounded-xl` (12px) while others use `rounded-2xl` (16px) or `rounded-full`, creating visual inconsistency.
+275. **Missing Confirmation Prompt on Exit During Invoice Drafting**: Navigating away from the invoice screen while items are entered discards the draft without confirmation.
+276. **Dark Theme Flashing During Cold Start**: Cold startup displays a white window background before Compose resolves `MidnightTeal`, causing screen flashing at night.
+277. **Font Family Loading Fallback Issues**: Custom system fonts fail to render correctly if device overrides system typeface with high-contrast text settings.
+278. **Missing Tooltips on Dense CMA Reports**: Financial terms like MPBF, Nayak Norms, and DSCR lack explanatory tooltips, confusing non-accountant shop owners.
+279. **Reconciliation Match Badge Misalignment**: Match confidence badges in bank recon wrap awkwardly when bank transaction descriptions are lengthy.
+280. **Disabled Buttons Look Identical to Enabled Buttons**: Disabled submit buttons lack opacity reduction, misleading users into thinking the app is unresponsive.
+281. **Unconstrained Height on Remarks Field**: Typing large remarks in the invoice builder expands the text area indefinitely, pushing action buttons off-screen.
+282. **Sticky Header Flickering on Fast Scroll**: Sticky headers in daybook register flicker when scrolling quickly through several hundred transactions.
+283. **Z-Index Collision on Modal Overlay**: In `app.js`, modal overlay uses `z-50`; if third-party components inject elements with higher z-index, dialogs render behind them.
+284. **Missing Visual Feedback During SHA-256 Hash Calculation**: Large audit chain verifications show no progress spinner, leaving cashiers wondering if the app froze.
+285. **Barcode Scanner UI Viewfinder Misaligned**: If barcode scanner is enabled, viewfinder box is not centered on non-16:9 aspect ratio devices.
+286. **Missing Focus Highlight for Android TV / D-Pad POS Terminals**: Android POS terminals with physical directional pads cannot navigate UI cards because focusable highlights are missing.
+287. **Overlapping Action Buttons on Split Screen**: When running in Android split-screen multitasking mode, POS buttons overlap each other.
+288. **Low Stock Alert Card Flashes Red Intrusively**: Low stock alert displays flashing animation continuously, distracting billing cashiers during high-speed checkout.
+289. **Missing Confirmation Dialog for Party Deletion**: If party deletion is added, deleting parties with active khata balances can happen accidentally.
+290. **Inconsistent Date Format Across Screens**: Dashboard displays `YYYY-MM-DD`, daybook displays `DD-MM-YYYY`, and audit log displays full ISO timestamp, confusing accounting staff.
+291. **Missing Currency Symbol in Stock Valuation Column**: Stock table valuation displays raw numeric strings without Indian currency formatting on certain screen widths.
+292. **Unstyled Horizontal Scrollbars on Web POS**: Browsers on Windows display bulky default scrollbars across product tables, obscuring the bottom row of data.
+293. **Toast Notifications Stack Vertically Off-Screen**: Rapid sequential toasts displace each other without animation limits, pushing notifications into the top display cutout.
+294. **Manager Unlock PIN Dots Do Not Animate**: PIN dots appear statically without spring animations, degrading the tactile feel of PIN entry.
+295. **Screen Header Store Code Badge Truncates on Ultra-Narrow Phones**: Store code badges like `TL-7319` truncate on 280dp wide fold outer screens.
+
+---
+
+### Section 7: Multi-Branch, Sync, Network & Offline Edge Cases (Bugs 296–345)
+
+296. **Split-Brain Branch Conflict on Offline Billing**: Two branches billing offline simultaneously assign duplicate serial invoice numbers (e.g., both issue `INV/2026-27/0001`).
+297. **Last-Write-Wins (LWW) Drops Intermediate Edits**: If counter 1 updates product stock to 40, and counter 2 simultaneously updates it to 35, LWW keeps one and drops the other, losing count of actual items sold.
+298. **Missing Offline Queue for Bank Feeds**: If bank feed import is triggered while offline, network failures fail silently without queuing requests for automatic background retry.
+299. **Missing WorkManager Integration for Background Sync**: Local sync is executed directly inside ViewModel scopes; closing the app before sync finishes terminates the synchronization job mid-flight.
+300. **Network Connectivity State Listener Missing**: App does not register a `ConnectivityManager.NetworkCallback`, failing to update the "Offline Active" status badge when connection returns.
+301. **Multi-Branch Cash In Hand Does Not Isolate Drawers**: Cash drawer totals aggregate all branches together; branch A can see and spend physical cash residing in branch B's drawer.
+302. **Stock Adjustments in One Branch Corrupt Global Inventory**: Inventory is held globally in `ProductItem`; selling items in Bhiwandi godown deducts stock from the Dadar retail counter catalog.
+303. **Inter-Branch Stock Transfers Omitted**: No mechanism exists to transfer stock from warehouse to shop counter without recording fictitious sales and purchases.
+304. **Sync Conflict Resolution Erases Void Reason**: During conflict resolution, tie-breaking canonical comparisons can overwrite an entry's `void_reason` with the winner's previous details.
+305. **Unbounded Sync Packet Size**: Syncing thousands of transactions sends the entire array in a single JSON payload instead of chunked pages, triggering network timeout exceptions.
+306. **Missing Compression on Sync Envelopes**: Large sync envelopes transmit uncompressed JSON text, consuming mobile data plans on counter cellular terminals.
+307. **Clock Drift Between Cash Counter Terminals**: If counter 1's clock is 5 minutes fast, its transactions consistently win LWW conflicts over counter 2's legitimate sales.
+308. **Simultaneous Database Access Across Multiple Processes**: If the app runs services in secondary processes, Room crashes with SQLite database locking errors.
+309. **Incomplete Error Handling in Coroutine Dispatchers**: Exceptions inside `viewModelScope.launch(Dispatchers.IO)` that are not caught explicitly by `try-catch` terminate the coroutine silently.
+310. **Missing Network Retry Backoff**: Sync failures retry immediately in loops rather than using exponential backoff with jitter, flooding local routers.
+311. **WebSocket / Real-time Notification Disconnect Unhandled**: Real-time push updates for counter collections fail to reconnect automatically when waking from device doze mode.
+312. **Insecure Cleartext Traffic Allowed in Manifest**: `AndroidManifest.xml` lacks `android:usesCleartextTraffic="false"`, permitting unencrypted HTTP communication if URLs are misconfigured.
+313. **Local Sync Status Displays Misleading "Synced" State**: `localSyncStatus` sets "All permissions persisted locally" without confirming that Room write operations completed without warnings.
+314. **Corrupted Sync Snapshot Replaces Valid Local DB**: Receiving a null or truncated remote snapshot overwrites local data tables with empty lists.
+315. **Missing ETag or Checksum in Cloud Backups**: Backups stored on Google Drive or remote storage lack MD5 checksum verification, risking restoration of corrupted backups.
+316. **Concurrent Impersonation Conflicts**: If two admins impersonate the same tenant simultaneously, their local state changes overwrite each other during synchronization.
+317. **Missing Conflict Log for User Audit**: When LWW resolves a conflict, the loser record is discarded without logging a reconciliation audit event.
+318. **Unencrypted Inter-Process Communication (IPC)**: Intent data passed to external sharing bridges contains unencrypted financial summaries.
+319. **Battery Optimization Kills Background Sync**: Android Doze Mode suspends network sync jobs because the app is not registered for battery optimization exemptions.
+320. **Airplane Mode Crash on UPI Intent Launch**: Launching a WhatsApp or UPI payment intent while in Airplane mode crashes if external apps fail to catch network states.
+321. **Incomplete Offline Fallback for CDN Libraries**: If the app is launched in a rural location without internet, React and Tailwind CDNs fail to load, rendering a blank screen.
+322. **Storage Leak on Repeated Sync Operations**: Sync payloads cached in temporary files are never cleaned up, consuming internal flash storage.
+323. **Lack of Bandwidth Throttling Detection**: Uploading large multi-year CMA reports over 2G connections causes socket timeout exceptions.
+324. **Inconsistent Serialization of Java `Date` vs Kotlin `String**`: Date fields parsed across Android and web engines diverge due to locale-specific month string abbreviations.
+325. **Missing DNS Fallback in Offline-First Architecture**: Android network lookups hang for 30 seconds before failing when connected to Wi-Fi without active internet access.
+326. **Multi-Branch Tax Invoices Share Single Serial Sequence**: Separate physical branches issuing invoices under the same GSTIN must have unique series prefixes (e.g. `DAD/` vs `BHW/`); Pabaru uses a shared prefix, violating Rule 46(b).
+327. **Sync Engine Overrides Void Conservatism**: In `store.js`:
+`javascript if (remoteRecord.is_voided && !localRecord.is_voided) return { winner: remoteRecord }; `
+If remote is un-voided (due to error) and local is voided, logic can revive cancelled transactions.
+328. **Missing Sync Progress Indicator**: Syncing large datasets provides no percentage progress bar, leaving users uncertain if synchronization is working.
+329. **Cross-Tenant Contamination via Impersonation**: If an admin impersonates Store B while offline, Store B's cached transactions can sync back to Store A's cloud account on reconnection.
+330. **No Support for External Bluetooth Barcode Scanners in SPP Mode**: The app handles keyboard HID scanners but cannot connect to Bluetooth SPP scanners directly.
+331. **Missing Offline Image Caching for Product Photos**: If product image URLs are used, images fail to load when the counter goes offline.
+332. **Web LocalStorage Cleared by Android Storage Manager**: If device storage runs low, Android WebView can purge LocalStorage, erasing the web app's data.
+333. **Lack of Encrypted Shared Preferences**: SharedPreferences are stored as plaintext XML files in the app sandbox, vulnerable on rooted phones.
+334. **Missing Network Connectivity Banner**: The UI lacks an offline notification banner, leading cashiers to believe online card payments were verified.
+335. **Multi-Branch Ledger Summary Overlaps**: Party balances do not filter by branch; a customer owing money at Branch 1 is prompted for collection at Branch 2 without inter-branch notification.
+336. **Sync Engine Emits Redundant Socket Events**: Merging collections emits database change events for every individual item rather than batching them into a single update.
+337. **Timezone Offset Glitch in Financial Year Transition**: Transactions entered at 12:15 AM on April 1st in IST are recorded under March 31st UTC, misallocating the transaction to the previous financial year.
+338. **Unchecked URI Schemes in Deep Links**: Custom URI schemes like `pabaru://` are not registered in the manifest, preventing external apps from launching the billing workflow.
+339. **Incomplete Handling of Android Backup Restore**: Google Drive auto-backup restores old databases over newer local offline transactions, resetting ledger state.
+340. **Missing Wi-Fi Direct Peer-to-Peer Counter Sync**: Counters in the same shop cannot sync with each other over local Wi-Fi without an internet connection.
+341. **Uncaught JSON Exceptions in Remote Push Payloads**: Receiving unexpected push notification structures crashes the background messaging service.
+342. **Database Version Incompatibility on Peer Sync**: Syncing between two phones running different app versions with incompatible database schemas causes parsing exceptions.
+343. **Missing Heartbeat Monitor for Offline Terminals**: Super Admin has no way to detect if a branch counter has been offline for several weeks.
+344. **Unvalidated Web Origin on PostMessage**: If `postMessage` is used between WebView and parent wrappers, origins are unverified, exposing bridges to cross-origin injection.
+345. **Stale Cache on WebView Reload**: WebView caching policies can serve outdated versions of `app.js` after an APK update, causing JavaScript runtime crashes.
+
+---
+
+### Section 8: Bank Reconciliation, CMA & Banking Engines (Bugs 346–395)
+
+346. **Bank Recon Exact Amount Matching Ignores Deducted Bank Charges**: An incoming customer payment of ₹10,000 net of ₹15 payment gateway charge (₹9,985) fails exact-amount auto-matching.
+347. **Bank Recon Date Tolerance Fails Over Bank Holidays**: Matching logic limits transaction date correlation to $\pm 2$ days; cheques deposited before 3-day long bank holiday weekends fail auto-matching.
+348. **Bank Recon Description Parser Fails on Non-Standard Narration**: Narrations like `NEFT/12345/M/S BALAJI` fail to extract party names if regex expects standard prefixes only.
+349. **Manual Match Allows One-to-Many Mismatches**: Linking a statement line to an already-reconciled transaction is not blocked, resulting in double-reconciliations.
+350. **Unlink Match Does Not Delete Balancing Transaction**: If a discrepancy resolution creates a balancing transaction and is later unlinked, the balancing entry remains in the ledger, inflating expenses.
+351. **OFX Statement Parser Fails on Multi-Line Tags**: OFX files from Indian banks with split `<NAME>` and `<MEMO>` tags fail XML/SGML regex extractors.
+352. **CSV Statement Parser Assumes Comma Delimiters**: Many Indian banks export statements using tab delimiters or semicolons; splitting by `,` produces corrupted columns.
+353. **Statement Import Lacks Deduplication**: Re-importing the same bank statement CSV duplicates all entries in `bankReconItems`.
+354. **Credit vs Debit Inversion in Custom Bank Statements**: Certain banks display withdrawals in a "Dr" column and deposits in "Cr"; inverted parsers record income as expenses.
+355. **Cheque Number Padding Issues**: Bank statements truncate leading zeros from cheque numbers (e.g. `001234` becomes `1234`), failing exact string matching against ledger records.
+356. **Bank Recon Item ID Collision**: Statement items use generic IDs like `REC-01`; importing two bank accounts with identical line counts creates duplicate primary keys.
+357. **Missing Unreconciled Balance Summary**: The bank register displays total ledger balance, but does not calculate adjusted balance as per bank statement.
+358. **CMA Statement Sales Growth Allows Negative Projections**: Inputting negative growth rates in CMA forecasting breaks historical progression calculations.
+359. **CMA Tandon Committee Method II Ignores Core Current Assets**: Tandon Method II requires deducting Core Current Assets before computing MPBF; the engine uses a simplified 25% of total current assets, producing non-compliant bank loan assessments.
+360. **Nayak Committee Working Capital Norms Applied to Large Borrowers**: Nayak Committee norms (20% of turnover) are statutory only for working capital limits up to ₹5 Crores; applying it to larger corporate entities violates RBI prudential lending guidelines.
+361. **Interest Coverage Ratio (ICR) Computes to NaN When Interest is Zero**: Debt-free businesses with ₹0 interest expense evaluate to `EBIT / 0 = NaN` or `Infinity` on bank project reports.
+362. **Debt to Equity Ratio Includes Non-Debt Current Liabilities**: Ratio calculations include trade creditors in total debt instead of restricting debt to term loans and bank borrowings.
+363. **Current Ratio Benchmark Comparison Inaccurate for Seasonal Industries**: The 1.33:1 benchmark is hardcoded; seasonal businesses (e.g. sugar, agro) requiring lower liquidity thresholds display incorrect warning flags.
+364. **Debtor Days Calculation Fails When Sales are Zero**: If a business is pre-revenue or new, `(Debtors / Sales) * 365` causes division by zero exceptions.
+365. **Inventory Days Uses Sales Instead of Cost of Goods Sold**: Standard accounting calculates Inventory Days as `(Inventory / COGS) * 365`; calculating against Gross Sales distorts inventory holding periods.
+366. **CMA Operating Statement Forecast Ignores Inflation**: Projections scale expenses linearly with turnover without accounting for fixed costs like rent and salaries.
+367. **Term Loan Amortization Schedule Excluded from Project Report**: The PDF report outlines loan amounts, but omits a month-by-month principal and interest amortization repayment table.
+368. **Moratorium Period Interest Capitalization Omitted**: Interest during construction/moratorium is not capitalized into total project cost, understating Means of Finance.
+369. **Promoter Contribution Below Statutory Minimum**: The engine allows submitting loan applications where promoter equity is $<15\%$, which is rejected by all Indian commercial banks.
+370. **Government Subsidy Subtracted Before Project Cost Determination**: Subsidies under PMEGP or state incentives must be kept in a special subsidy reserve account; netting them directly off project cost violates accounting standards.
+371. **Bank Recon Report Omitted from Super Admin**: Super admins cannot monitor reconciliation discrepancies across tenant stores.
+372. **CMA Project Report Market Potential Field Truncation**: Text exceeding 110 characters is cut off via `.take(110)`, producing truncated sentences on formal bank submissions.
+373. **Indirect Employment Generation Allows Negative Headcount**: Project report form accepts negative staffing numbers, corrupting appraisal ratios.
+374. **CMA Balance Sheet Projection Does Not Balance**: Retained earnings are added to equity, but counterpart cash allocations are not adjusted, producing balance sheets where Assets $\neq$ Liabilities.
+375. **Bank Reconciliation Reversal of Stale Entries Missing**: No workflow exists to debit a customer's account when their cheque bounces, along with bank penalty charges.
+376. **Missing IFSC Validation in UPI Deep-Links**: Generating UPI links with invalid IFSC codes causes bank transfer rejections.
+377. **UPI QR Code Omits Merchant Category Code (MCC)**: Static merchant QR codes lack the `&mc=` tag, causing payment gateways to flag high-volume counter collections.
+378. **Cash Withdrawal from Bank (Contra) Misallocated**: Logging a bank cash withdrawal records a `Payment Out` without crediting the cash drawer automatically.
+379. **Bank Deposit from Cash Misallocated**: Cash counter deposits record a `Payment In` without debiting the cash drawer balance.
+380. **Multiple Bank Accounts Default QR Ambiguity**: If multiple accounts are marked `is_default_for_qr = true`, the app selects whichever appears first in the array without validation.
+381. **Bank Account Deletion While Linked to Unreconciled Items**: Deleting a bank account leaves orphan statement items in memory.
+382. **CMA Statement FY Progression Mismatched with Indian Tax Year**: When run in January 2026, it labels the year `2026-27` instead of `2025-26`.
+383. **Tax Provision Rate Hardcoded to First Year's Rate**: `years.first().taxRatePercent` is applied to all projected years, ignoring future corporate tax rate changes or cess revisions.
+384. **Bank Account Number Plaintext Exposure**: Account numbers are displayed in full across invoice footers and WhatsApp messages instead of masking leading digits (e.g. `******1234`).
+385. **Missing Cheque Leaf Tracker**: The app has no cheque register to track used, cleared, and cancelled cheque leaves.
+386. **Overdraft / Cash Credit (CC) Account Limit Tracking Missing**: CC accounts display negative balances as standard liabilities without alerting when drawings exceed the sanctioned Drawing Power (DP).
+387. **Stock Audit Drawing Power (DP) Incalculable**: Banks require submitting monthly DP statements based on paid stock less creditors; the app cannot generate a statutory DP statement.
+388. **Bank Recon Does Not Group Split Deposits**: A single bank credit representing 5 grouped POS counter receipts cannot be matched against multiple ledger entries simultaneously.
+389. **CMA WhatsApp Share Format Errors on Web**: Multi-line strings in `buildString` create unescaped URL query breaks on desktop web browsers.
+390. **Missing Loan Sanction Letter Terms Verification**: The system does not track banking covenants, such as maintaining a minimum Current Ratio of 1.33.
+391. **Project Report Promoters Shareholding Excluded**: For private limited companies, the equity shareholding percentage of directors is omitted from CMA Form I.
+392. **Reconciliation Auto-Match Accepts 0% Confidence**: Clicking "Confirm All Matches" without setting a threshold can accept matches with low confidence scores.
+393. **Bank Statement Date Parser Inverts Day and Month on ISO Dates**: Statements using `YYYY-DD-MM` throw parse exceptions or produce invalid calendar days.
+394. **Bank Charges ITC Missing Self-Invoice Generation**: Under GST, if a bank does not issue an invoice for charges, self-invoicing is required; the app cannot generate reverse charge entries.
+395. **CMA Form IV Excludes Break-Even Point (BEP) Analysis**: Bank project appraisal requires calculating Debt Service Break-Even Capacity; this schedule is absent.
+
+---
+
+### Section 9: Business Profile, Multi-Tenant & Administrative Logic (Bugs 396–445)
+
+396. **Duplicate Store Codes Generated via Random Int**:
+`kotlin val randStoreCode = "TL-${(1000..9999).random()}" `
+Only 9,000 store codes exist; registering multiple businesses results in store code collisions, overwriting existing tenant profiles.
+397. **Udyam Registration Number Validation Absent**: Accepts invalid strings for Udyam numbers without verifying the format (`UDYAM-XX-00-0000000`).
+398. **Business Profile Phone Number Changes Break Authentication**: Changing the business phone number in profile settings prevents logging in with the old phone number without a recovery warning.
+399. **Super Admin Activation Status Overwritten on Client Profile Sync**: If a client updates their business profile locally, the synced entity can overwrite an admin-imposed suspension.
+400. **Store Code Case Sensitivity Glitch**: Entering `tl-7319` instead of `TL-7319` fails authentication on case-sensitive checks.
+401. **Super Admin Screen Lacks Tenant Search**: Onboarding hundreds of businesses renders a flat list without search or filter options, making tenant management difficult.
+402. **Tenant Impersonation Audit Log Attributed to Tenant**: When a Super Admin impersonates a tenant, actions are logged under the tenant owner's name instead of auditing the Super Admin's ID.
+403. **Business Legal Name vs Trade Name Omitted**: Invoices print trade name; Indian GST mandates displaying both the Legal Name of the person/entity and Trade Name on tax documents.
+404. **Signatory Title Mismatch for Partnerships**: Partnerships display "Proprietor" if entity type defaults to `Proprietorship` during hasty registration.
+405. **Missing State Code Validation on Business Registration**: Registering with a non-existent state code like `99` corrupts all downstream tax invoices.
+406. **Super Admin Master PIN Reset Mechanism Absent**: If the Super Admin forgets the master PIN, there is no hardware key or master recovery phrase to reset it, permanently locking the admin console.
+407. **Business Profile Email Validation Absent**: Accepts invalid email strings without checking RFC 5322 compliance.
+408. **Multiple Branches Exceeding Plan Limits**: Standard plan allows up to 3 branches, but the app does not enforce plan limit checks when adding extra branches.
+409. **Branch Code Collisions Allowed**: Multiple branches can be created with identical branch codes (e.g. `MUM`), confusing invoice numbering prefixes.
+410. **Branch Address Missing from Invoices**: If an invoice is issued from Sub-Branch Bhiwandi, the header still displays the Main Dadar address from the global business profile.
+411. **Tenant Deletion Does Not Clear Shared Preferences**: Deleting a managed user leaves cached settings in `pabaru_prefs.xml`.
+412. **Super Admin Impersonation Session Exit State Loss**: Exiting impersonation mode drops the admin back to the login screen rather than returning to the Super Admin console.
+413. **Super Admin Benefits Toggle Does Not Invalidate Local Feature Cache**: Unlocking GST Assistant for a tenant while they are online does not take effect until they restart the app.
+414. **Missing Export for Super Admin Tenant Directory**: Super Admins cannot export the tenant list or subscription status to Excel or CSV.
+415. **Business Type Field Restricted to Wholesale & Retail**: Service providers and manufacturing units have no dedicated profiles, leading to incorrect HSN/SAC classifications.
+416. **Opening Capital Modification Allows Arbitrary Balance Sheet Adjustments**: Users can change `openingCapitalPaise` at any time, distorting historical equity and net worth.
+417. **Store Code Format Incompatible with GST Portal**: Store codes are prepended to invoice numbers on some exports, producing invoice identifiers exceeding the 16-character statutory GST portal limit.
+418. **Unregistered Business Types Collect GST**: If registration type is set to `unregistered`, the invoice generator still allows manually selecting 18% GST rates, generating illegal tax invoices.
+419. **Missing PAN Extraction from GSTIN**: Updating GSTIN does not update the business PAN field automatically, creating discrepancies on printed invoices.
+420. **Composition Dealer Turnover Limit Warnings Omitted**: Composition scheme is limited to ₹1.5 Crores turnover (₹75 Lakhs for Special Category States); exceeding this does not trigger a warning to convert to Regular GST.
+421. **Super Admin Bulk Actions Lack Confirmation**: Suspending 50 tenants in bulk executes on a single tap without a confirmation dialog.
+422. **Managed User Sync Timestamps Default to Unix Epoch**: If sync fails, `lastSyncTimestamp` defaults to 0, displaying "Synced 56 years ago" in the UI.
+423. **Staff User Creation Allows Duplicate IDs**: Adding staff members can generate colliding IDs (`STF-01`), corrupting permission lookups.
+424. **Super Admin Master PIN Entry Lacks Obfuscation on External Displays**: Entering master PIN while connected to an external projector exposes the PIN in plaintext.
+425. **Business Entity Type Public Limited Signatory Title Error**: Lists "Director" instead of "Managing Director / Company Secretary" as mandated by Companies Act filing norms.
+426. **Opening Cash Balance Modification Post-Billing**: Altering opening cash balance retroactively changes historical cash drawer balances without an audit trail entry.
+427. **Missing Annual GST Return (GSTR-9) Summary**: The app provides monthly GSTR-1 summaries, but does not aggregate annual data for GSTR-9 statutory returns.
+428. **Staff Member Phone Number Validation Missing**: Staff user forms accept alphabetic characters in mobile number fields.
+429. **Business Profile PAN Entity Digit Mismatch**: Entering an individual PAN (`ABCDE1234F`) for a Private Limited company (which requires `C` as the 4th digit) is not flagged.
+430. **Branch Deletion Allowed with Active Transactions**: Deleting a branch with historical invoices leaves transactions with invalid foreign keys.
+431. **Super Admin Impersonation Does Not Clear Memory Cache**: Cached ViewModel state from an impersonated session can leak into subsequent tenant sessions.
+432. **Missing Multi-Currency Support**: All calculations hardcode INR; cross-border exports cannot record foreign currency amounts alongside INR parity.
+433. **Missing Tax Deducted at Source (TDS) Receivable Ledger**: Tax withheld by B2B clients cannot be accounted for against outstanding invoices.
+434. **Tenant Store Code Generation Allows Ambiguous Characters**: Random alphanumeric generation can include lookalike characters (`0` vs `O`, `1` vs `I`), causing cashier login mistakes.
+435. **Tenant Phone Number Duplication Across Stores**: Multiple distinct businesses can register with the exact same phone number, causing authentication lookups to pick the wrong tenant.
+436. **Missing Tenant Deactivation Reason**: Suspending a tenant deactivates their account without recording why (e.g. non-payment, fraud, expired trial).
+437. **Super Admin Dashboard Missing Revenue Analytics**: Super Admin console does not aggregate total transaction volume or subscription revenue across managed businesses.
+438. **Business Address Form Lacks Pincode Field**: Pincodes are typed as free text, preventing automated state and jurisdiction detection.
+439. **Staff Role Titles Free-Form Input**: Unstandardized role titles complicate role-based access control rules.
+440. **Missing Business Logo Upload for Invoices**: Businesses cannot upload a custom logo; receipts use generic text headers.
+441. **Tenant Impersonation Bypasses Multi-Factor Authentication**: Super Admin enters any tenant store without triggering secondary authentication alerts to the business owner.
+442. **Business Registration Lacks Terms of Service Agreement**: Registering a business does not prompt users to accept terms of service, creating legal compliance gaps.
+443. **Super Admin Back Button Triggers App Exit**: Pressing the back button inside the Super Admin screen exits the app instead of returning to the dashboard.
+444. **Business Email Verification Missing**: Verification emails are not sent to validate contact information during registration.
+445. **Super Admin Cannot Reset Staff PINs Remotely**: If a counter cashier forgets their staff PIN, the Super Admin cannot push a reset command to that terminal.
+
+---
+
+### Section 10: Performance, Resource Leaks, Memory & Packaging (Bugs 446–500)
+
+446. **Coroutines Memory Leak in Compose Views**: Launching coroutines using global scopes inside composables leaks ViewModels after screen navigation.
+447. **Unclosed `FileOutputStream` on PDF Generation Failure**: If an exception occurs before `FileOutputStream.use` completes, the file handle remains open, preventing temporary cache cleanup.
+448. **`Bitmap` Memory Leak in Canvas PDF Rendering**: `PdfDocument` page allocations are not recycled, throwing `OutOfMemoryError` during multi-page exports on 2GB RAM phones.
+449. **Unbounded Growth of In-Memory State Flows**: Emitting entire transaction histories into `_uiState` on every update causes garbage collector pauses on large ledgers.
+450. **Unchecked Thread Allocation in Hash Verification**: Genesis chain verification runs synchronously on the main thread when invoked from UI buttons, triggering ANR (Application Not Responding) dialogs on long chains.
+451. **Large JSON Payloads in LocalStorage**: Serializing large audit chains to browser `localStorage` freezes the WebKit UI process during serializations.
+452. **DOM Node Accumulation in POS Table**: Product lists render all rows directly without virtual windowing (`react-window`), degrading scrolling performance past 1,000 items.
+453. **Missing Hardware Acceleration Flags for Custom Canvas**: Certain drawing operations lack hardware acceleration, causing frame drops during invoice generation animations.
+454. **Overdraw in Compose Layout Hierarchy**: Nested background declarations across `MainActivity`, `MyApplicationTheme`, and custom screens cause 4x overdraw on low-tier GPUs.
+455. **Unused Asset Bundling**: Heavy launcher webp images across `mdpi`, `hdpi`, `xhdpi`, `xxhdpi`, and `xxxhdpi` folders bloat the APK size by several megabytes.
+456. **Missing ProGuard Keep Rules for Moshi Adapters**: Moshi code generation creates reflection adapters that get stripped if minification is enabled, crashing JSON parsing in production releases.
+457. **Missing ProGuard Keep Rules for Web JavaScript Interface**: If an Android bridge is added, obfuscation renames methods, breaking calls made from `window.AndroidBridge`.
+458. **Gradle Build Cache Key Collisions**: `build.gradle.kts` uses hardcoded environment variables that cause cache misses in CI build pipelines.
+459. **Strict Mode Disk Read Violations**: Reading SharedPreferences on the main thread during app launch triggers Android `StrictMode.ThreadPolicy` warnings.
+460. **Missing Recycled View Pools in Jetpack Compose WebViews**: WebViews held inside Compose composables re-instantiate on configuration changes, re-executing all asset scripts.
+461. **Regex Pre-compilation Missing in String Validators**: `Regex(...)` instances are instantiated inside validation methods rather than pre-compiled as package-level singletons, consuming CPU cycles on every keystroke.
+462. **Excessive Object Allocations in `formatPaise**`: String splits, string reversals, and chunking allocate multiple throwaway objects per currency display call.
+463. **Unused Dependencies in `libs.versions.toml**`: Dependencies like `firebase-ai`, `play-services-location`, and `camera-core` are declared without being used, slowing dependency resolution.
+464. **Missing APK Splitting by ABI**: Building universal APKs bundles multiple native architectures, doubling the download size for end users.
+465. **Uncompressed Web Assets in APK**: `index.html` and `.js` files are stored uncompressed in the `assets/` folder, increasing disk footprint.
+466. **WakeLock Missing in High-Volume Barcode Scanning**: The screen can time out and lock while a cashier is in the middle of scanning inventory with an external scanner.
+467. **Missing Lifecycle Observers on StateFlow Collection**: Collecting state flows without `repeatOnLifecycle` keeps background coroutines active when the app is minimized, draining battery.
+468. **Thermal Throttling on Continuous Hash Verifications**: Running complete genesis audit checks repeatedly causes CPU throttling on budget MediaTek chips.
+469. **Unchecked String Concatenation in Logging Statements**: Debug logging strings are evaluated even when log levels are disabled, allocating heap memory.
+470. **LeakCanary Flags ViewModel Retained in Anonymous Listeners**: Anonymous click listeners holding references to ViewModel instances prevent garbage collection after activity recreation.
+471. **Duplicate Room Queries on Filter Changes**: Changing filters in the Daybook view triggers two separate database read queries in rapid succession.
+472. **WebView File Access Enabled Insecurely**: If `WebSettings.setAllowFileAccess(true)` is left enabled, malicious JavaScript can read internal app files.
+473. **WebView Content Access Enabled Insecurely**: Leaving `setAllowContentAccess(true)` enabled allows WebViews to query local Content Providers.
+474. **WebView DOM Storage Left Enabled on Shared Devices**: DOM storage persists across staff sign-outs, allowing subsequent cashiers to extract cached data from previous sessions.
+475. **Missing Cache Busting on Web Assets**: Updating scripts inside `app/src/main/assets/` does not change asset file names; WebViews can continue serving stale bytecode from cache.
+476. **Missing Layout Weight Optimization in Compose**: Using multiple nested `weight()` modifiers inside Compose rows forces dual measurement passes, slowing down UI rendering.
+477. **Infinite Recomposition via Unstable Lambdas**: Passing inline lambdas to unannotated composables causes unnecessary recompositions of invoice line item lists.
+478. **Static Inner Class Leaks Context**: Singleton utility objects holding `Context` references cause application context leaks.
+479. **Missing Database Index on `products.barcode**`: Scanning barcodes requires full-table lookups, delaying product entry on catalogs with thousands of items.
+480. **Missing Database Index on `managed_users.phone**`: Authenticating via phone number causes table scans across tenant databases.
+481. **Unconstrained Image Decodes**: Loading invoice attachments without sampling bounds causes `OutOfMemoryError` crashes on large receipts.
+482. **Excessive Frame Drops During Keyboard Appearance**: Layout resize animations stutter when software keyboards open over complex Compose forms.
+483. **Mismatched Compose BOM Version**: `composeBom = "2024.09.00"` combined with Kotlin `2.2.10` and KSP `2.3.5` can trigger compiler plugin binary compatibility warnings.
+484. **Missing Network Security Config Domain Whitelist**: Network traffic cannot be pinned to specific trusted backup servers.
+485. **Android App Bundle (AAB) Resource Shrinking Disabled**: `isShrinkResources` is not configured in `buildTypes.release`, increasing release download size.
+486. **Unchecked Cast Exceptions in Domain Converters**: Casting JSON array items to `Int` throws `ClassCastException` when numbers are parsed as `Long` or `Double`.
+487. **Missing Heap Dump on OOM Configuration**: Debug builds lack `android:largeHeap="true"`, causing premature memory exhaustion when generating multi-page CMA reports.
+488. **Unsynchronized Access to Audit Log Array in Web Engine**: `setAuditLogs(prev => [...prev, newLog])` executed during rapid concurrent entries causes race conditions and dropped logs.
+489. **Missing Coroutine Exception Handler**: Unhandled exceptions in background threads terminate the application process without displaying a crash report dialog.
+490. **Missing Disk Space Check Before Exporting Backups**: Exporting large `.pabaru` backup files on nearly full flash memory throws unhandled I/O exceptions.
+491. **Missing Battery Level Checks on Long Background Syncs**: Syncing massive ledgers on low battery can cause device shutdown mid-write, corrupting database pages.
+492. **Thread Contention in SecureRandom Generation**: Repeatedly instantiating `SecureRandom()` causes entropy starvation and slows down cryptographic operations.
+493. **Missing Vector Graphic Path Caching**: Heavy SVG icons re-evaluate vector path data on every redraw, dropping animation frames.
+494. **Missing ProGuard Rules for Room Database**: Minification strips Room generated classes (`_Impl`), causing initialization crashes in release APKs.
+495. **Unused Gradle Secrets Plugin Configuration**: Secrets Gradle plugin looks for `.env` files that do not exist in default environments, slowing down clean builds.
+496. **Missing Android 15/16 16KB Page Size Alignment**: Native binary libraries in dependencies must align to 16KB page sizes for Android 15/16; unaligned libraries cause load failures.
+497. **WebView Debugging Enabled in Production**: Failing to disable `WebView.setWebContentsDebuggingEnabled(false)` in release builds allows attaching remote Chrome debuggers to inspect live customer balances.
+498. **Missing Foreground Service Notification for Long Operations**: Exporting multi-year reports can be killed by Android OS if background operations take longer than allowed limits.
+499. **Missing Explicit GC Hint on Memory Warning**: The app does not implement `onTrimMemory(level)` to purge bitmap caches during memory pressure, risking low-memory kills.
+500. **Unchecked Kotlin Version Compatibility with Gradle 9.x**: Gradle `9.3.1` combined with Kotlin `2.2.10` uses experimental features that can produce unexpected configuration caching issues during incremental builds.

@@ -1,0 +1,6 @@
+{
+  "name": "Pabaru Billing",
+  "description": "Offline-first GST billing app for Indian market with cash and bank reconciliation",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
